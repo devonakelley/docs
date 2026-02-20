@@ -1,0 +1,263 @@
+---
+title: "Kalibr integration"
+description: "Use outcome-aware routing across models, tools, and parameters with LangChain Python."
+---
+
+This guide covers how to use [Kalibr](https://kalibr.systems) with LangChain. Kalibr is not a model provider — it is an outcome-aware routing layer that learns from production results and routes each request to the best-performing execution path (model + tools + parameters).
+
+## Overview
+
+### How Kalibr differs from a chat model
+
+| Aspect | Standard chat model | Kalibr |
+|--------|-------------------|--------|
+| Model selection | Fixed at initialization | Dynamic, learned from outcomes |
+| Failure handling | Manual fallback logic | Automatic traffic shift away from failing paths |
+| Optimization | None | Continuous, based on success rate, cost, and latency |
+| Scope | Single model | Multiple models, tools, and parameter combinations |
+
+### When to use Kalibr
+
+- **Production agents with variable workloads** — different tasks benefit from different models
+- **Cost-sensitive deployments** — automatically shift traffic to cheaper paths when they perform equally well
+- **Multi-model resilience** — proactive routing away from degraded paths, not just reactive fallback on failure
+- **Continuous optimization** — eliminate manual A/B testing of model configurations
+
+<Info>
+    Kalibr uses [Thompson Sampling](https://en.wikipedia.org/wiki/Thompson_sampling) to balance exploration (trying alternative paths) with exploitation (using the best-known path). This prevents oscillation and minimizes cumulative regret.
+</Info>
+
+---
+
+## Setup
+
+### Credentials
+
+Create an account at [dashboard.kalibr.systems](https://dashboard.kalibr.systems) to get your API key and tenant ID.
+
+```python Set Kalibr credentials icon="key"
+import getpass
+import os
+
+if "KALIBR_API_KEY" not in os.environ:
+    os.environ["KALIBR_API_KEY"] = getpass.getpass("Enter your Kalibr API key: ")
+if "KALIBR_TENANT_ID" not in os.environ:
+    os.environ["KALIBR_TENANT_ID"] = getpass.getpass("Enter your Kalibr tenant ID: ")
+```
+
+You also need API keys for any model providers referenced in your paths (for example, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`).
+
+To enable automated <Tooltip tip="Log each step of a model's execution to debug and improve it">tracing</Tooltip> of your model calls, set your [LangSmith](https://docs.langchain.com/langsmith/home) API key:
+
+```python Enable tracing icon="flask"
+os.environ["LANGSMITH_API_KEY"] = getpass.getpass("Enter your LangSmith API key: ")
+os.environ["LANGSMITH_TRACING"] = "true"
+```
+
+### Installation
+
+<CodeGroup>
+    ```python pip
+    pip install -U kalibr[langchain]
+    ```
+    ```python uv
+    uv add "kalibr[langchain]"
+    ```
+</CodeGroup>
+
+---
+
+## Instantiation
+
+Create a `Router` with a goal and a set of paths, then call `as_langchain()` to get a LangChain-compatible chat model:
+
+```python Initialize router icon="robot"
+from kalibr import Router
+
+router = Router(
+    goal="extract_company",
+    paths=["gpt-4o", "claude-sonnet-4-20250514"],
+)
+
+model = router.as_langchain()
+```
+
+The returned `model` object is a drop-in replacement wherever a LangChain `BaseChatModel` is expected.
+
+---
+
+## Invocation
+
+Use the model like any other LangChain chat model:
+
+```python
+messages = [
+    {"role": "user", "content": "Extract the company name: Hi, Sarah from Stripe here."},
+]
+response = model.invoke(messages)
+print(response.text)
+```
+
+After each invocation, report the outcome so Kalibr can learn:
+
+```python Report outcome icon="check"
+router.report(success=True)
+```
+
+---
+
+## Usage with agents
+
+Kalibr integrates directly with @[`create_agent`]:
+
+```python
+from kalibr import Router
+from langchain.agents import create_agent
+
+router = Router(
+    goal="customer_support",
+    paths=[
+        {"model": "gpt-4o", "tools": ["knowledge_base"]},
+        {"model": "claude-sonnet-4-20250514", "tools": ["knowledge_base"]},
+        {"model": "gpt-4o-mini", "tools": ["knowledge_base"]},
+    ],
+)
+
+agent = create_agent(
+    model=router.as_langchain(),
+    tools=[knowledge_base_tool, ticket_tool],
+)
+
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "How do I reset my password?"}]}
+)
+
+# Report based on actual outcome
+router.report(success="reset" in result["messages"][-1].content.lower())
+```
+
+### Kalibr vs. `ModelFallbackMiddleware`
+
+LangChain's built-in [model fallback middleware](/oss/langchain/middleware/built-in#model-fallback) triggers only when a model call *fails* (for example, API errors or timeouts). Kalibr is fundamentally different:
+
+| | `ModelFallbackMiddleware` | Kalibr |
+|---|---|---|
+| Triggers | On model failure | On every request |
+| Strategy | Try next model in order | Route to best-performing path |
+| Learning | None | Learns from reported outcomes |
+| Scope | Models only | Models + tools + parameters |
+
+Use `ModelFallbackMiddleware` for simple error resilience. Use Kalibr when you want continuous, outcome-driven optimization of your agent's execution paths.
+
+---
+
+## Goal-based routing
+
+A **goal** represents a specific task your agent performs. Define separate routers for different tasks to let Kalibr optimize each one independently:
+
+```python
+from kalibr import Router
+
+# Each goal learns independently
+extraction_router = Router(
+    goal="extract_entities",
+    paths=["gpt-4o", "claude-sonnet-4-20250514"],
+)
+
+summarization_router = Router(
+    goal="summarize_document",
+    paths=["gpt-4o-mini", "claude-sonnet-4-20250514"],
+)
+```
+
+In a multi-node LangGraph agent, you can assign a different router to each node:
+
+```python
+from langgraph.graph import StateGraph
+
+graph = StateGraph(AgentState)
+graph.add_node("extract", extract_node)      # Uses extraction_router.as_langchain()
+graph.add_node("summarize", summarize_node)  # Uses summarization_router.as_langchain()
+```
+
+---
+
+## Outcome reporting
+
+Kalibr learns from outcomes you report. There are two approaches:
+
+### Manual reporting
+
+Report success or failure after evaluating the result:
+
+```python
+response = router.completion(
+    messages=[{"role": "user", "content": "Book a meeting for tomorrow at 2pm"}]
+)
+
+meeting_created = check_calendar_api()
+router.report(success=meeting_created)
+```
+
+### Automatic reporting
+
+Use `success_when` to define a function that evaluates the output automatically:
+
+```python
+router = Router(
+    goal="summarize",
+    paths=["gpt-4o", "claude-sonnet-4-20250514"],
+    success_when=lambda output: len(output) > 100,
+)
+
+response = router.completion(messages=[...])
+# Outcome is reported automatically based on the success_when function
+```
+
+<Tip>
+    Kalibr typically needs 20–50 outcomes per path to stabilize routing. Noisy signals surface real patterns when aggregated correctly — perfect attribution is not required.
+</Tip>
+
+---
+
+## Advanced routing
+
+### Tool-based routing
+
+Route between different tool configurations for the same model:
+
+```python
+router = Router(
+    goal="research_task",
+    paths=[
+        {"model": "gpt-4o", "tools": ["web_search"]},
+        {"model": "gpt-4o", "tools": ["code_interpreter"]},
+        {"model": "claude-sonnet-4-20250514"},
+    ],
+)
+```
+
+### Parameter-based routing
+
+Route between different parameter configurations:
+
+```python
+router = Router(
+    goal="creative_writing",
+    paths=[
+        {"model": "gpt-4o", "params": {"temperature": 0.3}},
+        {"model": "gpt-4o", "params": {"temperature": 0.9}},
+        {"model": "claude-sonnet-4-20250514", "params": {"temperature": 0.7}},
+    ],
+)
+```
+
+Each unique `(model, tools, params)` combination is tracked as a separate path.
+
+---
+
+## Resources
+
+- [Kalibr documentation](https://kalibr.systems/docs)
+- [Kalibr Python SDK on GitHub](https://github.com/kalibr-ai/kalibr-sdk-python)
+- [Kalibr dashboard](https://dashboard.kalibr.systems)

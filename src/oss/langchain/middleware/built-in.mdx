@@ -792,6 +792,10 @@ The middleware accepts a variable number of string arguments representing fallba
 
 </Accordion>
 
+<Note>
+    `ModelFallbackMiddleware` handles **reactive** fallback — it tries the next model only when the current one fails. For **proactive**, outcome-aware routing that learns from production results and continuously optimizes which model, tools, and parameters to use, see the [Kalibr integration](/oss/integrations/chat/kalibr).
+</Note>
+
 ### PII detection
 
 Detect and handle Personally Identifiable Information (PII) in conversations using configurable strategies. PII detection is useful for the following:
